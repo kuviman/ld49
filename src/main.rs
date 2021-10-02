@@ -1,6 +1,12 @@
 use geng::net::simple as simple_net;
 use geng::{prelude::*, TextAlign};
 
+mod camera;
+mod renderer;
+
+use camera::*;
+use renderer::*;
+
 type PlayerId = usize;
 
 #[derive(Debug, Serialize, Deserialize, Diff, Clone, PartialEq)]
@@ -17,10 +23,28 @@ impl HasId for Player {
 }
 
 #[derive(Debug, Serialize, Deserialize, Diff, Clone, PartialEq)]
+pub struct Block {
+    pub position: Vec2<f32>,
+    pub rotation: f32,
+    pub size: Vec2<f32>,
+    pub layer: usize,
+}
+
+impl Block {
+    pub fn matrix(&self) -> Mat4<f32> {
+        Mat4::rotate_z(self.rotation)
+            * Mat4::translate(self.position.extend(self.layer as f32))
+            * Mat4::scale(self.size.extend(1.0))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Diff, Clone, PartialEq)]
 struct Model {
     current_time: f32,
     next_player_id: PlayerId,
     players: Collection<Player>,
+    #[diff = "clone"]
+    blocks: Vec<Block>,
 }
 
 impl Model {
@@ -29,6 +53,12 @@ impl Model {
             current_time: 0.0,
             next_player_id: 1,
             players: Collection::new(),
+            blocks: vec![Block {
+                position: vec2(0.0, 0.0),
+                rotation: 0.0,
+                size: vec2(2.0, 4.0),
+                layer: 0,
+            }],
         }
     }
 }
@@ -76,6 +106,9 @@ struct Game {
     player: Player,
     model: simple_net::Remote<Model>,
     current_time: f32,
+    renderer: Renderer,
+    camera: Camera,
+    prev_mouse_pos: Vec2<f32>,
 }
 
 impl Game {
@@ -84,11 +117,14 @@ impl Game {
         let player = model.get().players.get(&player_id).unwrap().clone();
         Self {
             geng: geng.clone(),
+            renderer: Renderer::new(geng),
             traffic_watcher: geng::net::TrafficWatcher::new(),
             next_update: 0.0,
             model,
             player,
             current_time,
+            camera: Camera::new(),
+            prev_mouse_pos: Vec2::ZERO,
         }
     }
 }
@@ -132,52 +168,43 @@ impl geng::State for Game {
         }
     }
     fn draw(&mut self, framebuffer: &mut ugli::Framebuffer) {
-        ugli::clear(framebuffer, Some(Color::BLACK), None);
-        let camera = geng::Camera2d {
-            center: vec2(0.0, 0.0),
-            rotation: 0.0,
-            fov: 100.0,
-        };
+        ugli::clear(framebuffer, Some(Color::BLACK), Some(1.0));
         let model = self.model.get();
-        for player in &model.players {
-            self.geng
-                .draw_2d()
-                .circle(framebuffer, &camera, player.position, 1.0, Color::GRAY);
+        for block in &model.blocks {
+            self.renderer.draw(framebuffer, &self.camera, block);
         }
-        self.geng.draw_2d().circle(
-            framebuffer,
-            &camera,
-            self.player.position,
-            1.0,
-            Color::WHITE,
-        );
-        self.geng.default_font().draw(
-            framebuffer,
-            &geng::PixelPerfectCamera,
-            &format!("Server time: {:.1}", model.current_time),
-            vec2(0.0, 0.0),
-            TextAlign::LEFT,
-            32.0,
-            Color::WHITE,
-        );
-        self.geng.default_font().draw(
-            framebuffer,
-            &geng::PixelPerfectCamera,
-            &format!("Client time: {:.1}", self.current_time),
-            vec2(0.0, 32.0),
-            TextAlign::LEFT,
-            32.0,
-            Color::WHITE,
-        );
-        self.geng.default_font().draw(
-            framebuffer,
-            &geng::PixelPerfectCamera,
-            &format!("traffic: {}", self.traffic_watcher),
-            vec2(0.0, 32.0 * 2.0),
-            TextAlign::LEFT,
-            32.0,
-            Color::WHITE,
-        );
+        // for player in &model.players {
+        //     self.geng
+        //         .draw_2d()
+        //         .circle(framebuffer, &camera, player.position, 1.0, Color::GRAY);
+        // }
+        // self.geng.draw_2d().circle(
+        //     framebuffer,
+        //     &camera,
+        //     self.player.position,
+        //     1.0,
+        //     Color::WHITE,
+        // );
+    }
+    fn handle_event(&mut self, event: geng::Event) {
+        match event {
+            geng::Event::MouseMove { position } => {
+                let position = position.map(|x| x as f32);
+                if self
+                    .geng
+                    .window()
+                    .is_button_pressed(geng::MouseButton::Left)
+                {
+                    let delta = position - self.prev_mouse_pos;
+                    const SENS: f32 = 0.01;
+                    self.camera.rotation += delta.x * SENS;
+                    self.camera.attack_angle += delta.y * SENS;
+                }
+                self.prev_mouse_pos = position;
+                self.geng.window().set_cursor_position()
+            }
+            _ => {}
+        }
     }
 }
 
