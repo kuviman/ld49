@@ -7,53 +7,112 @@ mod renderer;
 use camera::*;
 use renderer::*;
 
-type PlayerId = usize;
+type Id = usize;
+
+const EPS: f32 = 1e-5;
 
 #[derive(Debug, Serialize, Deserialize, Diff, Clone, PartialEq)]
 struct Player {
-    id: PlayerId,
+    id: Id,
     position: Vec3<f32>,
 }
 
 impl HasId for Player {
-    type Id = PlayerId;
-    fn id(&self) -> &PlayerId {
+    type Id = Id;
+    fn id(&self) -> &Id {
         &self.id
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Side {
+    pub coord: usize,
+    pub positive: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize, Diff, Clone, PartialEq)]
 pub struct Block {
+    pub id: Id,
     pub position: Vec2<f32>,
     pub rotation: f32,
     pub size: Vec2<f32>,
-    pub layer: usize,
+    pub layer: i32,
+}
+
+impl HasId for Block {
+    type Id = Id;
+    fn id(&self) -> &Id {
+        &self.id
+    }
 }
 
 impl Block {
     pub fn matrix(&self) -> Mat4<f32> {
-        Mat4::translate(self.position.extend(self.layer as f32))
+        Mat4::translate(self.position.extend(self.layer as f32 + 0.5))
             * Mat4::rotate_z(self.rotation)
-            * Mat4::scale(self.size.extend(1.0))
+            * Mat4::scale(self.size.extend(0.5))
+            * Mat4::scale_uniform(0.99)
+    }
+    pub fn intersect(&self, mut ray: geng::CameraRay) -> Option<(f32, Side)> {
+        let im = self.matrix().inverse();
+        ray.from = (im * ray.from.extend(1.0)).xyz();
+        ray.dir = (im * ray.dir.extend(0.0)).xyz();
+        let mut result = (
+            f32::INFINITY,
+            Side {
+                coord: 0,
+                positive: true,
+            },
+        );
+        for coord in 0..3 {
+            let from = ray.from[coord];
+            let dir = ray.dir[coord];
+            if dir.abs() < EPS {
+                continue;
+            }
+            for value in [-1.0, 1.0] {
+                // from + dir * t = value
+                let t = (value - from) / dir;
+                if t > 0.0 {
+                    let p = ray.from + ray.dir * t;
+                    if p.x.abs() <= 1.0 + EPS && p.y.abs() <= 1.0 + EPS && p.z.abs() <= 1.0 + EPS {
+                        if t < result.0 {
+                            result = (
+                                t,
+                                Side {
+                                    coord,
+                                    positive: value > 0.0,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if result.0 == f32::INFINITY {
+            None
+        } else {
+            Some(result)
+        }
     }
 }
 
 #[derive(Debug, Serialize, Deserialize, Diff, Clone, PartialEq)]
 struct Model {
     current_time: f32,
-    next_player_id: PlayerId,
+    next_id: Id,
     players: Collection<Player>,
-    #[diff = "clone"]
-    blocks: Vec<Block>,
+    blocks: Collection<Block>,
 }
 
 impl Model {
     fn new() -> Self {
         Self {
             current_time: 0.0,
-            next_player_id: 1,
+            next_id: 1,
             players: Collection::new(),
-            blocks: vec![],
+            blocks: Collection::new(),
         }
     }
 }
@@ -62,15 +121,16 @@ impl Model {
 pub enum Message {
     UpdatePosition(Vec3<f32>),
     PlaceBlock(Block),
+    DeleteBlock(Id),
 }
 
 impl simple_net::Model for Model {
-    type PlayerId = PlayerId;
+    type PlayerId = Id;
     type Message = Message;
     const TICKS_PER_SECOND: f32 = 20.0;
-    fn new_player(&mut self) -> Self::PlayerId {
-        let player_id = self.next_player_id;
-        self.next_player_id += 1;
+    fn new_player(&mut self) -> Id {
+        let player_id = self.next_id;
+        self.next_id += 1;
         self.players.insert(Player {
             id: player_id,
             position: vec3(
@@ -81,16 +141,21 @@ impl simple_net::Model for Model {
         });
         player_id
     }
-    fn drop_player(&mut self, player_id: &PlayerId) {
+    fn drop_player(&mut self, player_id: &Id) {
         self.players.remove(player_id);
     }
-    fn handle_message(&mut self, player_id: &PlayerId, message: Self::Message) {
+    fn handle_message(&mut self, player_id: &Id, message: Self::Message) {
         match message {
             Message::UpdatePosition(position) => {
                 self.players.get_mut(player_id).unwrap().position = position;
             }
-            Message::PlaceBlock(block) => {
-                self.blocks.push(block);
+            Message::PlaceBlock(mut block) => {
+                block.id = self.next_id;
+                self.next_id += 1;
+                self.blocks.insert(block);
+            }
+            Message::DeleteBlock(id) => {
+                self.blocks.remove(&id);
             }
         }
     }
@@ -100,6 +165,7 @@ impl simple_net::Model for Model {
 }
 
 struct Game {
+    framebuffer_size: Vec2<usize>,
     geng: Geng,
     traffic_watcher: geng::net::TrafficWatcher,
     next_update: f32,
@@ -111,10 +177,11 @@ struct Game {
 }
 
 impl Game {
-    fn new(geng: &Geng, player_id: PlayerId, model: simple_net::Remote<Model>) -> Self {
+    fn new(geng: &Geng, player_id: Id, model: simple_net::Remote<Model>) -> Self {
         let current_time = model.get().current_time;
         let player = model.get().players.get(&player_id).unwrap().clone();
         Self {
+            framebuffer_size: vec2(1, 1),
             geng: geng.clone(),
             renderer: Renderer::new(geng),
             traffic_watcher: geng::net::TrafficWatcher::new(),
@@ -125,10 +192,61 @@ impl Game {
             camera: Camera::new(),
         }
     }
+    fn look(&self) -> Option<(Option<Id>, Vec3<f32>, Side)> {
+        let ray = self.camera.pixel_ray(vec2(2.0, 2.0), vec2(1.0, 1.0));
+        let model = self.model.get();
+        let mut closest_t = f32::INFINITY;
+        let mut closest_side = Side {
+            coord: 0,
+            positive: true,
+        };
+        let mut closest = None;
+        for block in &model.blocks {
+            if let Some((t, side)) = block.intersect(ray) {
+                if t < closest_t {
+                    closest_t = t;
+                    closest_side = side;
+                    closest = Some(block);
+                }
+            }
+        }
+        if ray.dir.z.abs() > EPS {
+            let t = -ray.from.z / ray.dir.z;
+            if t > 0.0 && t < closest_t {
+                closest_t = t;
+                closest_side = Side {
+                    coord: 2,
+                    positive: ray.from.z > 0.0,
+                };
+                closest = None;
+            }
+        }
+        if closest_t == f32::INFINITY {
+            None
+        } else {
+            let block_id = closest.map(|block| block.id);
+            Some((block_id, ray.from + ray.dir * closest_t, closest_side))
+        }
+    }
+    fn try_place(&self) -> Option<Block> {
+        if let Some((_, pos, side)) = self.look() {
+            if side.coord == 2 {
+                return Some(Block {
+                    id: 0, // Doesn't matter
+                    position: pos.xy(),
+                    rotation: self.camera.rotation,
+                    size: vec2(2.0, 4.0),
+                    layer: (pos.z + if side.positive { 0.5 } else { -0.5 }).floor() as i32,
+                });
+            }
+        }
+        None
+    }
 }
 
 impl geng::State for Game {
     fn update(&mut self, delta_time: f64) {
+        self.model.update();
         self.traffic_watcher.update(&self.model.traffic());
         let delta_time = delta_time as f32;
 
@@ -170,12 +288,62 @@ impl geng::State for Game {
         }
     }
     fn draw(&mut self, framebuffer: &mut ugli::Framebuffer) {
+        self.framebuffer_size = framebuffer.size();
         self.camera.look_at = self.player.position + vec3(0.0, 0.0, 5.0);
-        ugli::clear(framebuffer, Some(Color::BLACK), Some(1.0));
+        ugli::clear(framebuffer, Some(Color::WHITE), Some(1.0));
+        let look = self.look();
         let model = self.model.get();
+        self.renderer.draw(
+            framebuffer,
+            &self.camera,
+            &Block {
+                id: 0,
+                position: Vec2::ZERO,
+                rotation: 0.0,
+                layer: -1,
+                size: vec2(100.0, 100.0),
+            },
+            Color::rgb(0.8, 0.8, 0.8),
+            Color::rgb(0.8, 0.8, 0.8),
+        );
         for block in &model.blocks {
-            self.renderer.draw(framebuffer, &self.camera, block);
+            self.renderer.draw(
+                framebuffer,
+                &self.camera,
+                block,
+                Color::BLACK,
+                match look {
+                    Some((block_id, _, side)) if block_id == Some(block.id) => {
+                        if side.coord == 2 {
+                            Color::GREEN
+                        } else {
+                            Color::RED
+                        }
+                    }
+                    _ => Color::WHITE,
+                },
+            );
         }
+        if let Some(block) = self.try_place() {
+            self.renderer.draw(
+                framebuffer,
+                &self.camera,
+                &block,
+                Color::BLACK,
+                Color::TRANSPARENT_BLACK,
+            );
+        }
+        self.geng.draw_2d().circle(
+            framebuffer,
+            &geng::Camera2d {
+                center: Vec2::ZERO,
+                rotation: 0.0,
+                fov: 100.0,
+            },
+            Vec2::ZERO,
+            1.0,
+            Color::WHITE,
+        );
         // for player in &model.players {
         //     self.geng
         //         .draw_2d()
@@ -213,18 +381,17 @@ impl geng::State for Game {
                 ..
             } => {
                 self.geng.window().lock_cursor();
-
-                let ray = self.camera.pixel_ray(vec2(2.0, 2.0), vec2(1.0, 1.0));
+                if let Some(block) = self.try_place() {
+                    self.model.send(Message::PlaceBlock(block));
+                }
             }
-            geng::Event::KeyDown {
-                key: geng::Key::Space,
+            geng::Event::MouseDown {
+                button: geng::MouseButton::Right,
+                ..
             } => {
-                self.model.send(Message::PlaceBlock(Block {
-                    position: self.player.position.xy(),
-                    rotation: self.camera.rotation,
-                    size: vec2(2.0, 4.0),
-                    layer: self.player.position.z as usize,
-                }));
+                if let Some((Some(block_id), ..)) = self.look() {
+                    self.model.send(Message::DeleteBlock(block_id));
+                }
             }
             _ => {}
         }

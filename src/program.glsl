@@ -13,12 +13,16 @@ void main() {
 #endif
 
 #ifdef FRAGMENT_SHADER
+uniform vec4 u_border_color;
+uniform vec4 u_color;
 void main() {
     if (v_border_distance < 0.1) {
-        gl_FragColor = vec4(0.5, 0.5, 0.5, 1.0);
+        gl_FragColor = u_border_color;
     } else {
-        gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);
+        gl_FragColor = u_color;
     }
-    // gl_FragColor = vec4(border_distance, 1.0, 1.0, 1.0);
+    if (gl_FragColor.w < 0.5) {
+        discard;
+    }
 }
 #endif

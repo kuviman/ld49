@@ -1,5 +1,3 @@
-use std::default;
-
 use super::*;
 
 #[derive(ugli::Vertex, Copy, Clone, Debug)]
@@ -105,6 +103,8 @@ impl Renderer {
         framebuffer: &mut ugli::Framebuffer,
         camera: &impl geng::AbstractCamera3d,
         block: &Block,
+        border_color: Color<f32>,
+        color: Color<f32>,
     ) {
         let framebuffer_size = framebuffer.size();
         ugli::draw(
@@ -115,6 +115,8 @@ impl Renderer {
             (
                 ugli::uniforms! {
                     u_model_matrix: block.matrix(),
+                    u_border_color: border_color,
+                    u_color: color,
                 },
                 geng::camera3d_uniforms(camera, framebuffer_size.map(|x| x as f32)),
             ),
