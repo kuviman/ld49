@@ -11,16 +11,72 @@ type Id = usize;
 
 const EPS: f32 = 1e-5;
 
+const GRAVITY: f32 = 30.0;
+
 #[derive(Debug, Serialize, Deserialize, Diff, Clone, PartialEq)]
 struct Player {
     id: Id,
     position: Vec3<f32>,
+    jump_speed: f32,
+    can_jump: bool,
 }
 
 impl HasId for Player {
     type Id = Id;
     fn id(&self) -> &Id {
         &self.id
+    }
+}
+
+pub struct Intersection {
+    pub penetration: f32,
+    pub normal: Vec3<f32>,
+}
+
+impl Player {
+    const RADIUS: f32 = 1.0;
+    const HEIGHT: f32 = 6.0;
+    const JUMP_INITIAL_SPEED: f32 = 10.0;
+    pub fn intersect(&self, block: &Block) -> Option<Intersection> {
+        let mut penetration = Self::HEIGHT / 2.0 + 0.5
+            - (block.layer as f32 + 0.5 - (self.position.z + Self::HEIGHT / 2.0)).abs();
+        let mut normal: Vec3<f32> = vec3(
+            0.0,
+            0.0,
+            if self.position.z + Self::HEIGHT / 2.0 > block.layer as f32 + 0.5 {
+                1.0
+            } else {
+                -1.0
+            },
+        );
+        let delta_pos = Vec2::rotated(self.position.xy() - block.position, -block.rotation);
+        let size = block.size + vec2(Self::RADIUS, Self::RADIUS);
+        let x_penetration = size.x - delta_pos.x.abs();
+        if x_penetration < penetration {
+            penetration = x_penetration;
+            normal = Vec2::rotated(
+                vec2(if delta_pos.x > 0.0 { 1.0 } else { -1.0 }, 0.0),
+                block.rotation,
+            )
+            .extend(0.0);
+        }
+        let y_penetration = size.y - delta_pos.y.abs();
+        if y_penetration < penetration {
+            penetration = y_penetration;
+            normal = Vec2::rotated(
+                vec2(0.0, if delta_pos.y > 0.0 { 1.0 } else { -1.0 }),
+                block.rotation,
+            )
+            .extend(0.0);
+        }
+        if penetration < 0.0 {
+            None
+        } else {
+            Some(Intersection {
+                penetration,
+                normal,
+            })
+        }
     }
 }
 
@@ -138,6 +194,8 @@ impl simple_net::Model for Model {
                 global_rng().gen_range(-5.0..=5.0),
                 0.0,
             ),
+            jump_speed: 0.0,
+            can_jump: false,
         });
         player_id
     }
@@ -174,6 +232,7 @@ struct Game {
     current_time: f32,
     renderer: Renderer,
     camera: Camera,
+    floor: Block,
 }
 
 impl Game {
@@ -190,6 +249,13 @@ impl Game {
             player,
             current_time,
             camera: Camera::new(),
+            floor: Block {
+                id: 0,
+                position: Vec2::ZERO,
+                rotation: 0.0,
+                layer: -1,
+                size: vec2(100.0, 100.0),
+            },
         }
     }
     fn look(&self) -> Option<(Option<Id>, Vec3<f32>, Side)> {
@@ -247,6 +313,7 @@ impl Game {
 impl geng::State for Game {
     fn update(&mut self, delta_time: f64) {
         self.model.update();
+        let model = self.model.get();
         self.traffic_watcher.update(&self.model.traffic());
         let delta_time = delta_time as f32;
 
@@ -277,6 +344,21 @@ impl geng::State for Game {
         direction = direction.clamp(1.0);
         self.player.position +=
             Vec2::rotated(direction, self.camera.rotation).extend(0.0) * SPEED * delta_time;
+        self.player.jump_speed -= GRAVITY * delta_time;
+        self.player.position.z += self.player.jump_speed * delta_time;
+
+        self.player.can_jump = false;
+        for block in model.blocks.iter().chain(std::iter::once(&self.floor)) {
+            if let Some(intersection) = self.player.intersect(block) {
+                self.player.position += intersection.normal * intersection.penetration;
+                if intersection.normal.z > 0.5 {
+                    self.player.can_jump = true;
+                }
+                if intersection.normal.z.abs() > 0.5 {
+                    self.player.jump_speed = 0.0;
+                }
+            }
+        }
 
         self.next_update -= delta_time;
         if self.next_update < 0.0 {
@@ -289,20 +371,14 @@ impl geng::State for Game {
     }
     fn draw(&mut self, framebuffer: &mut ugli::Framebuffer) {
         self.framebuffer_size = framebuffer.size();
-        self.camera.look_at = self.player.position + vec3(0.0, 0.0, 5.0);
+        self.camera.look_at = self.player.position + vec3(0.0, 0.0, Player::HEIGHT * 0.9);
         ugli::clear(framebuffer, Some(Color::WHITE), Some(1.0));
         let look = self.look();
         let model = self.model.get();
         self.renderer.draw(
             framebuffer,
             &self.camera,
-            &Block {
-                id: 0,
-                position: Vec2::ZERO,
-                rotation: 0.0,
-                layer: -1,
-                size: vec2(100.0, 100.0),
-            },
+            &self.floor,
             Color::rgb(0.8, 0.8, 0.8),
             Color::rgb(0.8, 0.8, 0.8),
         );
@@ -338,24 +414,27 @@ impl geng::State for Game {
             &geng::Camera2d {
                 center: Vec2::ZERO,
                 rotation: 0.0,
-                fov: 100.0,
+                fov: 200.0,
             },
             Vec2::ZERO,
             1.0,
-            Color::WHITE,
+            Color::BLACK,
         );
-        // for player in &model.players {
-        //     self.geng
-        //         .draw_2d()
-        //         .circle(framebuffer, &camera, player.position, 1.0, Color::GRAY);
-        // }
-        // self.geng.draw_2d().circle(
-        //     framebuffer,
-        //     &camera,
-        //     self.player.position,
-        //     1.0,
-        //     Color::WHITE,
-        // );
+        for player in &model.players {
+            self.renderer.draw(
+                framebuffer,
+                &self.camera,
+                &Block {
+                    id: player.id,
+                    position: player.position.xy(),
+                    rotation: 0.0,
+                    size: vec2(Player::RADIUS, Player::RADIUS),
+                    layer: player.position.z as i32,
+                },
+                Color::BLACK,
+                Color::TRANSPARENT_BLACK,
+            );
+        }
     }
     fn handle_event(&mut self, event: geng::Event) {
         match event {
@@ -393,6 +472,14 @@ impl geng::State for Game {
                     self.model.send(Message::DeleteBlock(block_id));
                 }
             }
+            geng::Event::KeyDown { key } => match key {
+                geng::Key::Space => {
+                    if dbg!(self.player.can_jump) {
+                        self.player.jump_speed = Player::JUMP_INITIAL_SPEED;
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
