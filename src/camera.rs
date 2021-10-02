@@ -13,7 +13,7 @@ impl Camera {
             look_at: Vec3::ZERO,
             rotation: 0.0,
             attack_angle: 0.0,
-            distance: 10.0,
+            distance: 0.0,
         }
     }
 }

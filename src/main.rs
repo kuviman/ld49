@@ -1,5 +1,5 @@
 use geng::net::simple as simple_net;
-use geng::{prelude::*, TextAlign};
+use geng::prelude::*;
 
 mod camera;
 mod renderer;
@@ -12,7 +12,7 @@ type PlayerId = usize;
 #[derive(Debug, Serialize, Deserialize, Diff, Clone, PartialEq)]
 struct Player {
     id: PlayerId,
-    position: Vec2<f32>,
+    position: Vec3<f32>,
 }
 
 impl HasId for Player {
@@ -32,8 +32,8 @@ pub struct Block {
 
 impl Block {
     pub fn matrix(&self) -> Mat4<f32> {
-        Mat4::rotate_z(self.rotation)
-            * Mat4::translate(self.position.extend(self.layer as f32))
+        Mat4::translate(self.position.extend(self.layer as f32))
+            * Mat4::rotate_z(self.rotation)
             * Mat4::scale(self.size.extend(1.0))
     }
 }
@@ -53,19 +53,15 @@ impl Model {
             current_time: 0.0,
             next_player_id: 1,
             players: Collection::new(),
-            blocks: vec![Block {
-                position: vec2(0.0, 0.0),
-                rotation: 0.0,
-                size: vec2(2.0, 4.0),
-                layer: 0,
-            }],
+            blocks: vec![],
         }
     }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Message {
-    UpdatePosition(Vec2<f32>),
+    UpdatePosition(Vec3<f32>),
+    PlaceBlock(Block),
 }
 
 impl simple_net::Model for Model {
@@ -77,9 +73,10 @@ impl simple_net::Model for Model {
         self.next_player_id += 1;
         self.players.insert(Player {
             id: player_id,
-            position: vec2(
+            position: vec3(
                 global_rng().gen_range(-5.0..=5.0),
                 global_rng().gen_range(-5.0..=5.0),
+                0.0,
             ),
         });
         player_id
@@ -91,6 +88,9 @@ impl simple_net::Model for Model {
         match message {
             Message::UpdatePosition(position) => {
                 self.players.get_mut(player_id).unwrap().position = position;
+            }
+            Message::PlaceBlock(block) => {
+                self.blocks.push(block);
             }
         }
     }
@@ -108,7 +108,6 @@ struct Game {
     current_time: f32,
     renderer: Renderer,
     camera: Camera,
-    prev_mouse_pos: Vec2<f32>,
 }
 
 impl Game {
@@ -124,7 +123,6 @@ impl Game {
             player,
             current_time,
             camera: Camera::new(),
-            prev_mouse_pos: Vec2::ZERO,
         }
     }
 }
@@ -137,26 +135,30 @@ impl geng::State for Game {
         self.current_time += delta_time;
 
         const SPEED: f32 = 10.0;
+        let mut direction = Vec2::ZERO;
         if self.geng.window().is_key_pressed(geng::Key::Left)
             || self.geng.window().is_key_pressed(geng::Key::A)
         {
-            self.player.position.x -= SPEED * delta_time;
+            direction.x -= 1.0;
         }
         if self.geng.window().is_key_pressed(geng::Key::Right)
             || self.geng.window().is_key_pressed(geng::Key::D)
         {
-            self.player.position.x += SPEED * delta_time;
+            direction.x += 1.0;
         }
         if self.geng.window().is_key_pressed(geng::Key::Up)
             || self.geng.window().is_key_pressed(geng::Key::W)
         {
-            self.player.position.y += SPEED * delta_time;
+            direction.y += 1.0;
         }
         if self.geng.window().is_key_pressed(geng::Key::Down)
             || self.geng.window().is_key_pressed(geng::Key::S)
         {
-            self.player.position.y -= SPEED * delta_time;
+            direction.y -= 1.0;
         }
+        direction = direction.clamp(1.0);
+        self.player.position +=
+            Vec2::rotated(direction, self.camera.rotation).extend(0.0) * SPEED * delta_time;
 
         self.next_update -= delta_time;
         if self.next_update < 0.0 {
@@ -168,6 +170,7 @@ impl geng::State for Game {
         }
     }
     fn draw(&mut self, framebuffer: &mut ugli::Framebuffer) {
+        self.camera.look_at = self.player.position + vec3(0.0, 0.0, 5.0);
         ugli::clear(framebuffer, Some(Color::BLACK), Some(1.0));
         let model = self.model.get();
         for block in &model.blocks {
@@ -188,20 +191,40 @@ impl geng::State for Game {
     }
     fn handle_event(&mut self, event: geng::Event) {
         match event {
-            geng::Event::MouseMove { position } => {
-                let position = position.map(|x| x as f32);
-                if self
-                    .geng
-                    .window()
-                    .is_button_pressed(geng::MouseButton::Left)
-                {
-                    let delta = position - self.prev_mouse_pos;
-                    const SENS: f32 = 0.01;
-                    self.camera.rotation += delta.x * SENS;
-                    self.camera.attack_angle += delta.y * SENS;
-                }
-                self.prev_mouse_pos = position;
-                self.geng.window().set_cursor_position()
+            geng::Event::MouseMove { delta, .. } => {
+                let delta = delta.map(|x| x as f32);
+                // if self
+                //     .geng
+                //     .window()
+                //     .is_button_pressed(geng::MouseButton::Left)
+                // {
+                // let delta = position - self.prev_mouse_pos;
+                const SENS: f32 = 0.002;
+                self.camera.rotation -= delta.x * SENS;
+                self.camera.attack_angle = clamp(
+                    self.camera.attack_angle + delta.y * SENS,
+                    -f32::PI / 2.0..=f32::PI / 2.0,
+                );
+                // }
+                // self.prev_mouse_pos = position;
+            }
+            geng::Event::MouseDown {
+                button: geng::MouseButton::Left,
+                ..
+            } => {
+                self.geng.window().lock_cursor();
+
+                let ray = self.camera.pixel_ray(vec2(2.0, 2.0), vec2(1.0, 1.0));
+            }
+            geng::Event::KeyDown {
+                key: geng::Key::Space,
+            } => {
+                self.model.send(Message::PlaceBlock(Block {
+                    position: self.player.position.xy(),
+                    rotation: self.camera.rotation,
+                    size: vec2(2.0, 4.0),
+                    layer: self.player.position.z as usize,
+                }));
             }
             _ => {}
         }
