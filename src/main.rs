@@ -102,6 +102,73 @@ impl HasId for Block {
     }
 }
 
+fn intersect_segments(s1: [Vec2<f32>; 2], s2: [Vec2<f32>; 2]) -> Option<Vec2<f32>> {
+    let p1 = s1[0];
+    let e1 = s1[1] - s1[0];
+    let p2 = s2[0];
+    let e2 = s2[1] - s2[0];
+
+    if Vec2::skew(e1, e2).abs() < EPS {
+        return None;
+    }
+
+    // skew(p1 + e1 * t - p2, e2)
+    // t = skew(p2 - p1, e2) / skew(e1, e2)
+    let t = Vec2::skew(p2 - p1, e2) / Vec2::skew(e1, e2);
+    if t < 0.0 || t > 1.0 {
+        return None;
+    }
+    let p = p1 + e1 * t;
+    let t = Vec2::skew(p1 - p2, e1) / Vec2::skew(e2, e1);
+    if t < 0.0 || t > 1.0 {
+        return None;
+    }
+    Some(p)
+}
+
+fn is_inside(p: Vec2<f32>, vs: &[Vec2<f32>]) -> bool {
+    if vs.len() <= 3 {
+        return false;
+    }
+    for i in 0..vs.len() - 1 {
+        if Vec2::skew(vs[i + 1] - vs[i], p - vs[i]) < 0.0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn convex_hull(mut a: Vec<Vec2<f32>>) -> Vec<Vec2<f32>> {
+    a.sort_by_key(|p| r32(p.x));
+    let mut top = Vec::new();
+    let mut bottom = Vec::new();
+    for p in a {
+        while bottom.len() >= 2
+            && Vec2::skew(
+                bottom[bottom.len() - 1] - bottom[bottom.len() - 2],
+                p - bottom[bottom.len() - 1],
+            ) < 0.0
+        {
+            bottom.pop();
+        }
+        bottom.push(p);
+        while top.len() >= 2
+            && Vec2::skew(
+                top[top.len() - 1] - top[top.len() - 2],
+                p - top[top.len() - 1],
+            ) > 0.0
+        {
+            top.pop();
+        }
+        top.push(p);
+    }
+    top.pop();
+    top.reverse();
+    let mut result = bottom;
+    result.extend(top);
+    result
+}
+
 impl Block {
     pub fn matrix(&self) -> Mat4<f32> {
         Mat4::translate(self.position.extend(self.layer as f32 + 0.5))
@@ -152,6 +219,44 @@ impl Block {
             Some(result)
         }
     }
+    pub fn points_2d(&self) -> Vec<Vec2<f32>> {
+        let e1 = Vec2::rotated(vec2(1.0, 0.0), self.rotation);
+        let e2 = Vec2::rotate_90(e1);
+
+        let sx = e1 * self.size.x;
+        let sy = e2 * self.size.y;
+
+        let mut result = vec![sx + sy, -sx + sy, -sx - sy, sx - sy];
+        for p in &mut result {
+            *p += self.position;
+        }
+        result
+    }
+    pub fn intersect_2d(&self, other: &Self) -> Vec<Vec2<f32>> {
+        let mut p1 = self.points_2d();
+        p1.push(p1[0]);
+        let mut p2 = other.points_2d();
+        p2.push(p2[0]);
+        let mut result = Vec::new();
+        for i in 0..4 {
+            for j in 0..4 {
+                if let Some(p) = intersect_segments([p1[i], p1[i + 1]], [p2[j], p2[j + 1]]) {
+                    result.push(p);
+                }
+            }
+        }
+        for &p in &p1[..4] {
+            if is_inside(p, &p2) {
+                result.push(p);
+            }
+        }
+        for &p in &p2[..4] {
+            if is_inside(p, &p1) {
+                result.push(p);
+            }
+        }
+        result
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Diff, Clone, PartialEq)]
@@ -183,7 +288,7 @@ pub enum Message {
 impl simple_net::Model for Model {
     type PlayerId = Id;
     type Message = Message;
-    const TICKS_PER_SECOND: f32 = 20.0;
+    const TICKS_PER_SECOND: f32 = 5.0;
     fn new_player(&mut self) -> Id {
         let player_id = self.next_id;
         self.next_id += 1;
@@ -219,6 +324,87 @@ impl simple_net::Model for Model {
     }
     fn tick(&mut self) {
         self.current_time += 1.0 / Self::TICKS_PER_SECOND;
+        let mut blocks: Vec<Block> = self.blocks.iter().cloned().collect();
+        blocks.sort_by_key(|block| -block.layer);
+
+        let mut next: Vec<usize> = (0..blocks.len()).collect();
+        let mut top = vec![None; blocks.len()];
+        let mut processed = vec![false; blocks.len()];
+
+        for i in 0..blocks.len() {
+            if processed[i] {
+                continue;
+            }
+            processed[i] = true;
+
+            let mut support_points = Vec::new();
+            let mut support_blocks = Vec::new();
+            let mut current_blocks = Vec::new();
+            {
+                let mut i = i;
+                while let Some(top) = top[i] {
+                    i = top;
+                    let mut i = i;
+                    loop {
+                        current_blocks.push(i);
+                        if next[i] == i {
+                            break;
+                        }
+                        i = next[i];
+                    }
+                }
+            }
+
+            {
+                let mut i = i;
+                loop {
+                    current_blocks.push(i);
+                    let block = &blocks[i];
+                    if block.layer == 0 {
+                        support_points.extend(block.points_2d());
+                    }
+                    for j in (i + 1)..blocks.len() {
+                        let other = &blocks[j];
+                        if other.layer == block.layer - 1 {
+                            let intersection = block.intersect_2d(other);
+                            if !intersection.is_empty() {
+                                support_blocks.push(j);
+                                support_points.extend(intersection);
+                            }
+                        }
+                    }
+                    if next[i] == i {
+                        break;
+                    }
+                    i = next[i];
+                }
+            }
+
+            support_blocks.sort();
+            support_blocks.dedup();
+            for window in support_blocks.windows(2) {
+                let a = window[0];
+                let b = window[1];
+                next[a] = b;
+            }
+            if let Some(&block) = support_blocks.first() {
+                top[block] = Some(i);
+            }
+
+            let mut center_of_mass = Vec2::ZERO;
+            for &block in &current_blocks {
+                center_of_mass += blocks[block].position;
+            }
+            center_of_mass /= current_blocks.len() as f32;
+
+            let support = convex_hull(support_points);
+            if !is_inside(center_of_mass, &support) {
+                for block in current_blocks {
+                    self.blocks.remove(&blocks[block].id);
+                }
+                return;
+            }
+        }
     }
 }
 
@@ -233,6 +419,7 @@ struct Game {
     renderer: Renderer,
     camera: Camera,
     floor: Block,
+    place_rotation: f32,
 }
 
 impl Game {
@@ -256,6 +443,7 @@ impl Game {
                 layer: -1,
                 size: vec2(100.0, 100.0),
             },
+            place_rotation: 0.0,
         }
     }
     fn look(&self) -> Option<(Option<Id>, Vec3<f32>, Side)> {
@@ -300,8 +488,8 @@ impl Game {
                 return Some(Block {
                     id: 0, // Doesn't matter
                     position: pos.xy(),
-                    rotation: self.camera.rotation,
-                    size: vec2(2.0, 4.0),
+                    rotation: self.camera.rotation + self.place_rotation,
+                    size: vec2(1.0, 3.0) * 1.5,
                     layer: (pos.z + if side.positive { 0.5 } else { -0.5 }).floor() as i32,
                 });
             }
@@ -435,6 +623,27 @@ impl geng::State for Game {
                 Color::TRANSPARENT_BLACK,
             );
         }
+
+        // for a in &model.blocks {
+        //     for b in &model.blocks {
+        //         if a.layer == b.layer - 1 {
+        //             for p in a.intersect_2d(b) {
+        //                 if let Some(p) = self.camera.world_to_screen(
+        //                     self.framebuffer_size.map(|x| x as f32),
+        //                     p.extend(b.layer as f32),
+        //                 ) {
+        //                     self.geng.draw_2d().circle(
+        //                         framebuffer,
+        //                         &geng::PixelPerfectCamera,
+        //                         p,
+        //                         10.0,
+        //                         Color::BLUE,
+        //                     );
+        //                 }
+        //             }
+        //         }
+        //     }
+        // }
     }
     fn handle_event(&mut self, event: geng::Event) {
         match event {
@@ -480,6 +689,9 @@ impl geng::State for Game {
                 }
                 _ => {}
             },
+            geng::Event::Wheel { delta } => {
+                self.place_rotation += delta as f32 * 0.005;
+            }
             _ => {}
         }
     }
