@@ -357,7 +357,7 @@ pub enum Message {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 enum Event {
-    BlockFall(Block),
+    BlockFall(Block, Option<(Vec2<f32>, Vec2<f32>, i32)>),
 }
 
 impl simple_net::Model for Model {
@@ -371,7 +371,7 @@ impl simple_net::Model for Model {
         self.players.insert(Player {
             id: player_id,
             attack_angle: 0.0,
-            name: "".to_owned(),
+            name: "noname".to_owned(),
             rotation: 0.0,
             position: vec3(
                 global_rng().gen_range(-5.0..=5.0),
@@ -425,7 +425,29 @@ impl simple_net::Model for Model {
             if processed[i] {
                 continue;
             }
-            processed[i] = true;
+
+            {
+                for j in 0..blocks.len() {
+                    let mut t = j;
+                    while next[t] != t {
+                        t = next[t];
+                    }
+                    next[j] = t;
+                }
+                let mut current = Vec::new();
+                for j in 0..blocks.len() {
+                    if next[j] == next[i] {
+                        current.push(j);
+                    }
+                }
+                for window in current.windows(2) {
+                    next[window[0]] = window[1];
+                }
+                let last = *current.last().unwrap();
+                next[last] = last;
+            }
+
+            let current_layer = blocks[i].layer;
 
             let mut support_points = Vec::new();
             let mut support_blocks = Vec::new();
@@ -437,11 +459,11 @@ impl simple_net::Model for Model {
                     current_blocks: &mut Vec<usize>,
                     next: &[usize],
                 ) {
+                    current_blocks.push(i);
                     for &i in &top[i] {
                         go_up(i, top, current_blocks, next);
                         let mut i = i;
                         loop {
-                            current_blocks.push(i);
                             if next[i] == i {
                                 break;
                             }
@@ -456,11 +478,12 @@ impl simple_net::Model for Model {
                 let mut i = i;
                 loop {
                     current_blocks.push(i);
+                    processed[i] = true;
                     let block = &blocks[i];
                     if block.layer == 0 {
                         support_points.extend(block.points_2d());
                     }
-                    for j in (i + 1)..blocks.len() {
+                    for j in 0..blocks.len() {
                         let other = &blocks[j];
                         if other.layer == block.layer - 1 {
                             let intersection = block.intersect_2d(other);
@@ -480,11 +503,17 @@ impl simple_net::Model for Model {
             support_blocks.sort();
             support_blocks.dedup();
             for window in support_blocks.windows(2) {
-                let a = window[0];
-                let b = window[1];
+                let mut a = window[0];
+                while next[a] != a {
+                    a = next[a];
+                }
+                let mut b = window[1];
+                while next[b] != b {
+                    b = next[b];
+                }
                 next[a] = b;
             }
-            if let Some(&block) = support_blocks.first() {
+            for &block in &support_blocks {
                 top[block].push(i);
             }
 
@@ -499,9 +528,21 @@ impl simple_net::Model for Model {
 
             let support = convex_hull(support_points);
             if !is_inside(center_of_mass, &support) {
+                let mut edge = None;
+                if support.len() > 3 {
+                    let mut min_skew = 0.0;
+                    for i in 0..support.len() - 1 {
+                        let skew =
+                            Vec2::skew(support[i + 1] - support[i], center_of_mass - support[i]);
+                        if skew < min_skew {
+                            min_skew = skew;
+                            edge = Some((support[i], support[i + 1], current_layer));
+                        }
+                    }
+                }
                 for block in current_blocks {
                     if let Some(block) = self.blocks.remove(&blocks[block].id) {
-                        events.push(Event::BlockFall(block));
+                        events.push(Event::BlockFall(block, edge));
                     }
                 }
                 return;
@@ -513,6 +554,7 @@ impl simple_net::Model for Model {
 struct FallingBlock {
     block: Block,
     t: f32,
+    edge: Option<(Vec2<f32>, Vec2<f32>, i32)>,
 }
 
 struct Game {
@@ -531,14 +573,25 @@ struct Game {
     block_size: f32,
     interpolated_players: Collection<InterpolatedPlayer>,
     editing: bool,
+    assets: Assets,
+    last_blocks: HashSet<Id>,
 }
 const PLACE_DISTANCE: f32 = 20.0;
 
 impl Game {
-    fn new(geng: &Geng, player_id: Id, model: simple_net::Remote<Model>) -> Self {
+    fn play_sound(&self, sound: &geng::Sound, pos: Vec3<f32>) {
+        let mut effect = sound.effect();
+        let vol = 1.01f32.powf(-(pos - self.camera.look_at).len()) as f64;
+        effect.set_volume(vol);
+        println!("{:?}", vol);
+        effect.play();
+    }
+    fn new(geng: &Geng, player_id: Id, model: simple_net::Remote<Model>, assets: Assets) -> Self {
         let current_time = model.get().current_time;
         let player = model.get().players.get(&player_id).unwrap().clone();
+        let last_blocks = model.get().blocks.iter().map(|block| block.id).collect();
         Self {
+            assets,
             framebuffer_size: vec2(1, 1),
             geng: geng.clone(),
             renderer: Renderer::new(geng),
@@ -560,6 +613,7 @@ impl Game {
             block_size: 1.5,
             interpolated_players: Collection::new(),
             editing: false,
+            last_blocks,
         }
     }
     fn look(&self) -> Option<(Option<Id>, Vec3<f32>, Side)> {
@@ -656,14 +710,37 @@ impl Game {
 
 impl geng::State for Game {
     fn update(&mut self, delta_time: f64) {
+        let mut falled_played = false;
         for event in self.model.update() {
             match event {
-                Event::BlockFall(block) => {
-                    self.falling_blocks.push(FallingBlock { block, t: 0.0 });
+                Event::BlockFall(block, edge) => {
+                    if !falled_played {
+                        falled_played = true;
+                        self.play_sound(
+                            &self.assets.fall,
+                            block.position.extend(block.layer as f32),
+                        );
+                    }
+                    self.falling_blocks.push(FallingBlock {
+                        block,
+                        t: 0.0,
+                        edge,
+                    });
                 }
             }
         }
         let model = self.model.get();
+        let blocks: HashSet<Id> = model.blocks.iter().map(|block| block.id).collect();
+        for &block in &blocks {
+            if !self.last_blocks.contains(&block) {
+                let block = model.blocks.get(&block).unwrap();
+                self.play_sound(
+                    &self.assets.place,
+                    block.position.extend(block.layer as f32),
+                );
+            }
+        }
+        self.last_blocks = blocks;
         self.traffic_watcher.update(&self.model.traffic());
         let delta_time = delta_time as f32;
 
@@ -671,25 +748,27 @@ impl geng::State for Game {
 
         const SPEED: f32 = 10.0;
         let mut direction = Vec2::ZERO;
-        if self.geng.window().is_key_pressed(geng::Key::Left)
-            || self.geng.window().is_key_pressed(geng::Key::A)
-        {
-            direction.x -= 1.0;
-        }
-        if self.geng.window().is_key_pressed(geng::Key::Right)
-            || self.geng.window().is_key_pressed(geng::Key::D)
-        {
-            direction.x += 1.0;
-        }
-        if self.geng.window().is_key_pressed(geng::Key::Up)
-            || self.geng.window().is_key_pressed(geng::Key::W)
-        {
-            direction.y += 1.0;
-        }
-        if self.geng.window().is_key_pressed(geng::Key::Down)
-            || self.geng.window().is_key_pressed(geng::Key::S)
-        {
-            direction.y -= 1.0;
+        if !self.editing {
+            if self.geng.window().is_key_pressed(geng::Key::Left)
+                || self.geng.window().is_key_pressed(geng::Key::A)
+            {
+                direction.x -= 1.0;
+            }
+            if self.geng.window().is_key_pressed(geng::Key::Right)
+                || self.geng.window().is_key_pressed(geng::Key::D)
+            {
+                direction.x += 1.0;
+            }
+            if self.geng.window().is_key_pressed(geng::Key::Up)
+                || self.geng.window().is_key_pressed(geng::Key::W)
+            {
+                direction.y += 1.0;
+            }
+            if self.geng.window().is_key_pressed(geng::Key::Down)
+                || self.geng.window().is_key_pressed(geng::Key::S)
+            {
+                direction.y -= 1.0;
+            }
         }
         direction = direction.clamp(1.0);
         if self.geng.window().is_key_pressed(geng::Key::PageDown) {
@@ -796,13 +875,32 @@ impl geng::State for Game {
             );
         }
         for block in &self.falling_blocks {
-            self.renderer.draw(
-                framebuffer,
-                &self.camera,
-                Mat4::translate(vec3(0.0, 0.0, -block.t * block.t * 10.0)) * block.block.matrix(),
-                Color::BLACK,
-                Color::rgb(1.0, 0.5, 0.5),
-            );
+            let t = block.t * block.t * 10.0;
+            match block.edge {
+                Some((p1, p2, layer)) => {
+                    let p1 = p1.extend(layer as f32);
+                    let p2 = p2.extend(layer as f32);
+                    self.renderer.draw(
+                        framebuffer,
+                        &self.camera,
+                        Mat4::translate(p1 - vec3(0.0, 0.0, (t - f32::PI / 2.0).max(0.0)))
+                            * Mat4::rotate((p2 - p1).normalize(), t.min(f32::PI / 2.0))
+                            * Mat4::translate(-p1)
+                            * block.block.matrix(),
+                        Color::BLACK,
+                        Color::rgb(1.0, 0.5, 0.5),
+                    );
+                }
+                None => {
+                    self.renderer.draw(
+                        framebuffer,
+                        &self.camera,
+                        Mat4::translate(vec3(0.0, 0.0, -t)) * block.block.matrix(),
+                        Color::BLACK,
+                        Color::rgb(1.0, 0.5, 0.5),
+                    );
+                }
+            }
         }
         if let Some((block, can_place)) = self.try_place() {
             self.renderer.draw(
@@ -958,19 +1056,50 @@ impl geng::State for Game {
         //     }
         // }
 
-        self.geng.default_font().draw(
-            framebuffer,
-            &geng::PixelPerfectCamera,
-            if self.editing {
-                self.player.name.as_str()
-            } else {
-                "Press Enter to change name"
-            },
-            vec2(self.framebuffer_size.x as f32 / 2.0, 10.0),
-            geng::TextAlign::CENTER,
-            32.0,
-            Color::BLACK,
-        );
+        if self.editing {
+            self.geng.draw_2d().quad(
+                framebuffer,
+                &geng::PixelPerfectCamera,
+                AABB::point(Vec2::ZERO).extend_uniform(5000.0),
+                Color::rgba(1.0, 1.0, 1.0, 0.5),
+            );
+            self.geng.default_font().draw(
+                framebuffer,
+                &geng::Camera2d {
+                    center: Vec2::ZERO,
+                    rotation: 0.0,
+                    fov: 15.0,
+                },
+                &format!(
+                    "Press Enter to finish\n{}",
+                    match self.player.name.as_str() {
+                        "" => "Start typing your name",
+                        s => s,
+                    }
+                ),
+                vec2(0.0, 0.0),
+                geng::TextAlign::CENTER,
+                1.0,
+                Color::BLACK,
+            );
+        } else {
+            self.geng.default_font().draw(
+                framebuffer,
+                &geng::Camera2d {
+                    center: Vec2::ZERO,
+                    rotation: 0.0,
+                    fov: 20.0,
+                },
+                &format!(
+                    "You are {:?}\nPress Enter to edit your name",
+                    self.player.name
+                ),
+                vec2(0.0, -9.0),
+                geng::TextAlign::CENTER,
+                1.0,
+                Color::GRAY,
+            );
+        }
     }
     fn handle_event(&mut self, event: geng::Event) {
         match event {
@@ -1009,6 +1138,12 @@ impl geng::State for Game {
                 if let Some((Some(block_id), pos, ..)) = self.look() {
                     if (pos - self.player.position).len() < PLACE_DISTANCE {
                         self.model.send(Message::DeleteBlock(block_id));
+                        let model = self.model.get();
+                        let block = model.blocks.get(&block_id).unwrap();
+                        self.play_sound(
+                            &self.assets.del,
+                            block.position.extend(block.layer as f32),
+                        );
                     }
                 }
             }
@@ -1027,7 +1162,9 @@ impl geng::State for Game {
                     }
                     geng::Key::Enter => {
                         self.editing = !self.editing;
-                        if !self.editing {
+                        if self.editing {
+                            self.player.name = "".to_owned();
+                        } else {
                             self.model
                                 .send(Message::ChangeName(self.player.name.clone()));
                         }
@@ -1038,7 +1175,7 @@ impl geng::State for Game {
                     _ => {}
                 }
                 let c = format!("{:?}", key);
-                if c.len() == 1 && self.editing {
+                if c.len() == 1 && self.editing && self.player.name.len() < 20 {
                     self.player.name.push_str(&c);
                 }
             }
@@ -1050,8 +1187,36 @@ impl geng::State for Game {
     }
 }
 
+#[derive(geng::Assets)]
+struct Assets {
+    jump: geng::Sound,
+    del: geng::Sound,
+    fall: geng::Sound,
+    place: geng::Sound,
+}
+
 fn main() {
     logger::init().unwrap();
 
-    geng::net::simple::run("Multiplayer", Model::new, Game::new);
+    // Setup working directory
+    if let Some(dir) = std::env::var_os("CARGO_MANIFEST_DIR") {
+        std::env::set_current_dir(std::path::Path::new(&dir).join("static")).unwrap();
+    } else {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(path) = std::env::current_exe().unwrap().parent() {
+                std::env::set_current_dir(path).unwrap();
+            }
+        }
+    }
+
+    geng::net::simple::run("Multiplayer", Model::new, |geng, player_id, model| {
+        let geng_clone = geng.clone();
+        geng::LoadingScreen::new(
+            geng,
+            geng::EmptyLoadingScreen,
+            geng::LoadAsset::load(geng, "."),
+            move |assets| Game::new(&geng_clone, player_id, model, assets.unwrap()),
+        )
+    });
 }
