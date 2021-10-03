@@ -862,7 +862,9 @@ impl geng::State for Game {
     }
     fn handle_event(&mut self, event: geng::Event) {
         match event {
-            geng::Event::MouseMove { delta, .. } if !self.editing => {
+            geng::Event::MouseMove { delta, .. }
+                if !self.editing && self.geng.window().cursor_locked() =>
+            {
                 let delta = delta.map(|x| x as f32);
                 // if self
                 //     .geng
