@@ -290,12 +290,38 @@ struct Model {
 
 impl Model {
     fn new() -> Self {
-        Self {
+        let mut result = Self {
             current_time: 0.0,
             next_id: 1,
             players: Collection::new(),
             blocks: Collection::new(),
+        };
+        for _ in 0..100 {
+            let pos = vec2(
+                global_rng().gen_range(-100.0..=100.0),
+                global_rng().gen_range(-100.0..=100.0),
+            );
+            let rotation = global_rng().gen_range(0.0..=2.0 * f32::PI);
+            let block = Block {
+                id: result.next_id,
+                position: pos,
+                rotation,
+                layer: 0,
+                size: vec2(1.0, 3.0) * global_rng().gen_range(0.5..=2.0),
+            };
+            let mut can_place = true;
+            for other in &result.blocks {
+                if !block.intersect_2d(other).is_empty() {
+                    can_place = false;
+                    break;
+                }
+            }
+            if can_place {
+                result.blocks.insert(block);
+            }
+            result.next_id += 1;
         }
+        result
     }
 }
 
@@ -644,6 +670,13 @@ impl geng::State for Game {
             direction.y -= 1.0;
         }
         direction = direction.clamp(1.0);
+        if self.geng.window().is_key_pressed(geng::Key::PageDown) {
+            self.block_size -= delta_time;
+        }
+        if self.geng.window().is_key_pressed(geng::Key::PageUp) {
+            self.block_size += delta_time;
+        }
+        self.block_size = clamp(self.block_size, 0.5..=2.0);
         self.player.position +=
             Vec2::rotated(direction, self.camera.rotation).extend(0.0) * SPEED * delta_time;
         self.player.jump_speed -= GRAVITY * delta_time;
@@ -915,10 +948,10 @@ impl geng::State for Game {
                         }
                     }
                     geng::Key::PageDown => {
-                        self.block_size = (self.block_size - 0.5).max(0.5);
+                        // self.block_size = (self.block_size - 0.5).max(0.5);
                     }
                     geng::Key::PageUp => {
-                        self.block_size = (self.block_size + 0.5).min(2.0);
+                        // self.block_size = (self.block_size + 0.5).min(2.0);
                     }
                     geng::Key::Enter => {
                         self.editing = !self.editing;
