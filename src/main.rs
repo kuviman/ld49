@@ -505,7 +505,7 @@ impl Game {
                 position: Vec2::ZERO,
                 rotation: 0.0,
                 layer: -1,
-                size: vec2(100.0, 100.0),
+                size: vec2(1000.0, 1000.0),
             },
             place_rotation: 0.0,
             falling_blocks: Vec::new(),
@@ -650,7 +650,7 @@ impl geng::State for Game {
         self.player.position.z += self.player.jump_speed * delta_time;
 
         self.player.can_jump = false;
-        for block in model.blocks.iter().chain(std::iter::once(&self.floor)) {
+        for block in model.blocks.iter() {
             if let Some(intersection) = self.player.intersect(block) {
                 self.player.position += intersection.normal * intersection.penetration;
                 if intersection.normal.z > 0.5 {
@@ -660,6 +660,12 @@ impl geng::State for Game {
                     self.player.jump_speed = 0.0;
                 }
             }
+        }
+
+        if self.player.position.z < 0.0 {
+            self.player.position.z = 0.0;
+            self.player.jump_speed = 0.0;
+            self.player.can_jump = true;
         }
 
         self.next_update -= delta_time;
@@ -694,15 +700,16 @@ impl geng::State for Game {
     fn draw(&mut self, framebuffer: &mut ugli::Framebuffer) {
         self.framebuffer_size = framebuffer.size();
         self.camera.look_at = self.player.position + vec3(0.0, 0.0, Player::HEIGHT * 0.9);
-        ugli::clear(framebuffer, Some(Color::WHITE), Some(1.0));
+        ugli::clear(framebuffer, Some(Color::rgb(0.8, 0.8, 1.0)), Some(1.0));
         let look = self.look();
         let model = self.model.get();
+        self.floor.position = self.camera.look_at.xy();
         self.renderer.draw(
             framebuffer,
             &self.camera,
             self.floor.matrix(),
-            Color::rgb(0.8, 0.8, 0.8),
-            Color::rgb(0.8, 0.8, 0.8),
+            Color::rgb(0.8, 1.0, 0.8),
+            Color::rgb(0.8, 1.0, 0.8),
         );
         for block in &model.blocks {
             self.renderer.draw(
@@ -776,14 +783,14 @@ impl geng::State for Game {
                     (Player::HEIGHT - Player::RADIUS * 2.0) / 2.0,
                 )) * Mat4::translate(vec3(0.0, 0.0, 1.0)),
                 Color::BLACK,
-                Color::WHITE,
+                Color::rgb(1.0, 0.8, 0.8),
             );
             self.renderer.draw(
                 framebuffer,
                 &self.camera,
                 head_mat * Mat4::scale_uniform(Player::RADIUS),
                 Color::BLACK,
-                Color::WHITE,
+                Color::rgb(1.0, 0.8, 0.8),
             );
             for eye_pos in [-1.0, 1.0] {
                 self.renderer.draw(
