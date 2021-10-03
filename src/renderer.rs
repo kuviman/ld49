@@ -102,7 +102,7 @@ impl Renderer {
         &self,
         framebuffer: &mut ugli::Framebuffer,
         camera: &impl geng::AbstractCamera3d,
-        block: &Block,
+        block_matrix: Mat4<f32>,
         border_color: Color<f32>,
         color: Color<f32>,
     ) {
@@ -114,7 +114,7 @@ impl Renderer {
             &self.box_geometry,
             (
                 ugli::uniforms! {
-                    u_model_matrix: block.matrix(),
+                    u_model_matrix: block_matrix,
                     u_border_color: border_color,
                     u_color: color,
                 },

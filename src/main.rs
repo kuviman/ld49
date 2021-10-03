@@ -36,11 +36,11 @@ pub struct Intersection {
 impl Player {
     const RADIUS: f32 = 1.0;
     const HEIGHT: f32 = 6.0;
-    const JUMP_INITIAL_SPEED: f32 = 10.0;
+    const JUMP_INITIAL_SPEED: f32 = 15.0;
     pub fn intersect(&self, block: &Block) -> Option<Intersection> {
-        let mut penetration = Self::HEIGHT / 2.0 + 0.5
+        let vertical_penetration = Self::HEIGHT / 2.0 + 0.5
             - (block.layer as f32 + 0.5 - (self.position.z + Self::HEIGHT / 2.0)).abs();
-        let mut normal: Vec3<f32> = vec3(
+        let vertical_normal: Vec3<f32> = vec3(
             0.0,
             0.0,
             if self.position.z + Self::HEIGHT / 2.0 > block.layer as f32 + 0.5 {
@@ -49,6 +49,8 @@ impl Player {
                 -1.0
             },
         );
+        let mut penetration = vertical_penetration;
+        let mut normal = vertical_normal;
         let delta_pos = Vec2::rotated(self.position.xy() - block.position, -block.rotation);
         let size = block.size + vec2(Self::RADIUS, Self::RADIUS);
         let x_penetration = size.x - delta_pos.x.abs();
@@ -69,6 +71,16 @@ impl Player {
             )
             .extend(0.0);
         }
+
+        // if vertical_normal.z > 0.0
+        //     && vertical_penetration < 1.5
+        //     && vertical_penetration > 0.0
+        //     && vertical_penetration - 1.5 < penetration
+        // {
+        //     penetration = vertical_penetration;
+        //     normal = vertical_normal;
+        // }
+
         if penetration < 0.0 {
             None
         } else {
@@ -131,7 +143,7 @@ fn is_inside(p: Vec2<f32>, vs: &[Vec2<f32>]) -> bool {
         return false;
     }
     for i in 0..vs.len() - 1 {
-        if Vec2::skew(vs[i + 1] - vs[i], p - vs[i]) < 0.0 {
+        if Vec2::skew(vs[i + 1] - vs[i], p - vs[i]) < -EPS {
             return false;
         }
     }
@@ -141,8 +153,13 @@ fn is_inside(p: Vec2<f32>, vs: &[Vec2<f32>]) -> bool {
 fn convex_hull(mut a: Vec<Vec2<f32>>) -> Vec<Vec2<f32>> {
     a.sort_by_key(|p| r32(p.x));
     let mut top = Vec::new();
-    let mut bottom = Vec::new();
+    let mut bottom: Vec<Vec2<f32>> = Vec::new();
     for p in a {
+        if let Some(&prev) = bottom.last() {
+            if (prev - p).len() < EPS {
+                continue;
+            }
+        }
         while bottom.len() >= 2
             && Vec2::skew(
                 bottom[bottom.len() - 1] - bottom[bottom.len() - 2],
@@ -285,9 +302,15 @@ pub enum Message {
     DeleteBlock(Id),
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+enum Event {
+    BlockFall(Block),
+}
+
 impl simple_net::Model for Model {
     type PlayerId = Id;
     type Message = Message;
+    type Event = Event;
     const TICKS_PER_SECOND: f32 = 5.0;
     fn new_player(&mut self) -> Id {
         let player_id = self.next_id;
@@ -313,6 +336,11 @@ impl simple_net::Model for Model {
                 self.players.get_mut(player_id).unwrap().position = position;
             }
             Message::PlaceBlock(mut block) => {
+                for other in &self.blocks {
+                    if other.layer == block.layer && !block.intersect_2d(other).is_empty() {
+                        return;
+                    }
+                }
                 block.id = self.next_id;
                 self.next_id += 1;
                 self.blocks.insert(block);
@@ -322,13 +350,13 @@ impl simple_net::Model for Model {
             }
         }
     }
-    fn tick(&mut self) {
+    fn tick(&mut self, events: &mut Vec<Event>) {
         self.current_time += 1.0 / Self::TICKS_PER_SECOND;
         let mut blocks: Vec<Block> = self.blocks.iter().cloned().collect();
         blocks.sort_by_key(|block| -block.layer);
 
         let mut next: Vec<usize> = (0..blocks.len()).collect();
-        let mut top = vec![None; blocks.len()];
+        let mut top = vec![vec![]; blocks.len()];
         let mut processed = vec![false; blocks.len()];
 
         for i in 0..blocks.len() {
@@ -341,18 +369,25 @@ impl simple_net::Model for Model {
             let mut support_blocks = Vec::new();
             let mut current_blocks = Vec::new();
             {
-                let mut i = i;
-                while let Some(top) = top[i] {
-                    i = top;
-                    let mut i = i;
-                    loop {
-                        current_blocks.push(i);
-                        if next[i] == i {
-                            break;
+                fn go_up(
+                    i: usize,
+                    top: &[Vec<usize>],
+                    current_blocks: &mut Vec<usize>,
+                    next: &[usize],
+                ) {
+                    for &i in &top[i] {
+                        go_up(i, top, current_blocks, next);
+                        let mut i = i;
+                        loop {
+                            current_blocks.push(i);
+                            if next[i] == i {
+                                break;
+                            }
+                            i = next[i];
                         }
-                        i = next[i];
                     }
                 }
+                go_up(i, &top, &mut current_blocks, &next);
             }
 
             {
@@ -388,24 +423,34 @@ impl simple_net::Model for Model {
                 next[a] = b;
             }
             if let Some(&block) = support_blocks.first() {
-                top[block] = Some(i);
+                top[block].push(i);
             }
 
             let mut center_of_mass = Vec2::ZERO;
+            let mut total_weight = 0.0;
             for &block in &current_blocks {
-                center_of_mass += blocks[block].position;
+                let block = &blocks[block];
+                center_of_mass += block.position * block.size.x * block.size.y;
+                total_weight += block.size.x * block.size.y;
             }
-            center_of_mass /= current_blocks.len() as f32;
+            center_of_mass /= total_weight;
 
             let support = convex_hull(support_points);
             if !is_inside(center_of_mass, &support) {
                 for block in current_blocks {
-                    self.blocks.remove(&blocks[block].id);
+                    if let Some(block) = self.blocks.remove(&blocks[block].id) {
+                        events.push(Event::BlockFall(block));
+                    }
                 }
                 return;
             }
         }
     }
+}
+
+struct FallingBlock {
+    block: Block,
+    t: f32,
 }
 
 struct Game {
@@ -415,11 +460,13 @@ struct Game {
     next_update: f32,
     player: Player,
     model: simple_net::Remote<Model>,
+    falling_blocks: Vec<FallingBlock>,
     current_time: f32,
     renderer: Renderer,
     camera: Camera,
     floor: Block,
     place_rotation: f32,
+    block_size: f32,
 }
 
 impl Game {
@@ -444,6 +491,8 @@ impl Game {
                 size: vec2(100.0, 100.0),
             },
             place_rotation: 0.0,
+            falling_blocks: Vec::new(),
+            block_size: 1.5,
         }
     }
     fn look(&self) -> Option<(Option<Id>, Vec3<f32>, Side)> {
@@ -482,16 +531,57 @@ impl Game {
             Some((block_id, ray.from + ray.dir * closest_t, closest_side))
         }
     }
-    fn try_place(&self) -> Option<Block> {
+    fn try_place_at(&self, pos: Vec2<f32>, layer: i32) -> (Block, bool) {
+        let block = Block {
+            id: 0, // Doesn't matter
+            position: pos,
+            rotation: self.camera.rotation + self.place_rotation,
+            size: vec2(1.0, 3.0) * self.block_size,
+            layer,
+        };
+        for other in &self.model.get().blocks {
+            if block.layer == other.layer && !block.intersect_2d(other).is_empty() {
+                return (block, false);
+            }
+        }
+        (block, true)
+    }
+    fn try_place(&self) -> Option<(Block, bool)> {
+        let ray = self.camera.pixel_ray(vec2(2.0, 2.0), vec2(1.0, 1.0));
+        if ray.dir.z.abs() < EPS {
+            return None;
+        }
+        let mut pos = ray.from;
+        const PLACE_DISTANCE: f32 = 20.0;
+        while (pos - ray.from).len() < PLACE_DISTANCE {
+            {
+                let layer = (pos.z + if ray.dir.z > 0.0 { -0.5 } else { 0.5 }).floor() as i32;
+                let pos = pos.xy();
+                let (block, can_place) = self.try_place_at(pos, layer);
+                if can_place {
+                    if block.layer == 0 {
+                        return Some((block, true));
+                    }
+                    for other in &self.model.get().blocks {
+                        if block.layer == other.layer + 1 && !block.intersect_2d(other).is_empty() {
+                            return Some((block, true));
+                        }
+                    }
+                }
+            }
+            pos += ray.dir / ray.dir.z.abs();
+        }
         if let Some((_, pos, side)) = self.look() {
-            if side.coord == 2 {
-                return Some(Block {
-                    id: 0, // Doesn't matter
-                    position: pos.xy(),
-                    rotation: self.camera.rotation + self.place_rotation,
-                    size: vec2(1.0, 3.0) * 1.5,
-                    layer: (pos.z + if side.positive { 0.5 } else { -0.5 }).floor() as i32,
-                });
+            if side.coord == 2 && (pos - ray.from).len() < PLACE_DISTANCE {
+                let layer = (pos.z + if side.positive { 0.5 } else { -0.5 }).floor() as i32;
+                let pos = pos.xy();
+                for add in 0..1 {
+                    let (block, can_place) = self.try_place_at(pos, layer + add);
+                    if can_place {
+                        return Some((block, true));
+                    }
+                }
+                return Some(self.try_place_at(pos, layer));
             }
         }
         None
@@ -500,7 +590,13 @@ impl Game {
 
 impl geng::State for Game {
     fn update(&mut self, delta_time: f64) {
-        self.model.update();
+        for event in self.model.update() {
+            match event {
+                Event::BlockFall(block) => {
+                    self.falling_blocks.push(FallingBlock { block, t: 0.0 });
+                }
+            }
+        }
         let model = self.model.get();
         self.traffic_watcher.update(&self.model.traffic());
         let delta_time = delta_time as f32;
@@ -556,6 +652,11 @@ impl geng::State for Game {
             self.model
                 .send(Message::UpdatePosition(self.player.position));
         }
+
+        for block in &mut self.falling_blocks {
+            block.t += delta_time;
+        }
+        self.falling_blocks.retain(|block| block.t < 10.0);
     }
     fn draw(&mut self, framebuffer: &mut ugli::Framebuffer) {
         self.framebuffer_size = framebuffer.size();
@@ -566,7 +667,7 @@ impl geng::State for Game {
         self.renderer.draw(
             framebuffer,
             &self.camera,
-            &self.floor,
+            self.floor.matrix(),
             Color::rgb(0.8, 0.8, 0.8),
             Color::rgb(0.8, 0.8, 0.8),
         );
@@ -574,26 +675,35 @@ impl geng::State for Game {
             self.renderer.draw(
                 framebuffer,
                 &self.camera,
-                block,
+                block.matrix(),
                 Color::BLACK,
                 match look {
-                    Some((block_id, _, side)) if block_id == Some(block.id) => {
-                        if side.coord == 2 {
-                            Color::GREEN
-                        } else {
-                            Color::RED
-                        }
+                    Some((block_id, _, _)) if block_id == Some(block.id) => {
+                        Color::rgb(0.7, 0.7, 0.7)
                     }
                     _ => Color::WHITE,
                 },
             );
         }
-        if let Some(block) = self.try_place() {
+        for block in &self.falling_blocks {
             self.renderer.draw(
                 framebuffer,
                 &self.camera,
-                &block,
+                Mat4::translate(vec3(0.0, 0.0, -block.t * block.t * 10.0)) * block.block.matrix(),
                 Color::BLACK,
+                Color::rgb(1.0, 0.5, 0.5),
+            );
+        }
+        if let Some((block, can_place)) = self.try_place() {
+            self.renderer.draw(
+                framebuffer,
+                &self.camera,
+                block.matrix(),
+                if can_place {
+                    Color::rgb(0.0, 0.7, 0.0)
+                } else {
+                    Color::RED
+                },
                 Color::TRANSPARENT_BLACK,
             );
         }
@@ -612,13 +722,14 @@ impl geng::State for Game {
             self.renderer.draw(
                 framebuffer,
                 &self.camera,
-                &Block {
+                Block {
                     id: player.id,
                     position: player.position.xy(),
                     rotation: 0.0,
                     size: vec2(Player::RADIUS, Player::RADIUS),
                     layer: player.position.z as i32,
-                },
+                }
+                .matrix(),
                 Color::BLACK,
                 Color::TRANSPARENT_BLACK,
             );
@@ -669,7 +780,7 @@ impl geng::State for Game {
                 ..
             } => {
                 self.geng.window().lock_cursor();
-                if let Some(block) = self.try_place() {
+                if let Some((block, true)) = self.try_place() {
                     self.model.send(Message::PlaceBlock(block));
                 }
             }
@@ -683,9 +794,15 @@ impl geng::State for Game {
             }
             geng::Event::KeyDown { key } => match key {
                 geng::Key::Space => {
-                    if dbg!(self.player.can_jump) {
+                    if self.player.can_jump {
                         self.player.jump_speed = Player::JUMP_INITIAL_SPEED;
                     }
+                }
+                geng::Key::PageDown => {
+                    self.block_size = (self.block_size - 0.5).max(0.5);
+                }
+                geng::Key::PageUp => {
+                    self.block_size = (self.block_size + 0.5).min(2.0);
                 }
                 _ => {}
             },
