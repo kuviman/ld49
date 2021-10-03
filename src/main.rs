@@ -16,7 +16,11 @@ const GRAVITY: f32 = 30.0;
 #[derive(Debug, Serialize, Deserialize, Diff, Clone, PartialEq)]
 struct Player {
     id: Id,
+    #[diff = "eq"]
+    name: String,
     position: Vec3<f32>,
+    rotation: f32,
+    attack_angle: f32,
     jump_speed: f32,
     can_jump: bool,
 }
@@ -297,9 +301,10 @@ impl Model {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Message {
-    UpdatePosition(Vec3<f32>),
+    UpdatePosition(Vec3<f32>, f32, f32),
     PlaceBlock(Block),
     DeleteBlock(Id),
+    ChangeName(String),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -317,6 +322,9 @@ impl simple_net::Model for Model {
         self.next_id += 1;
         self.players.insert(Player {
             id: player_id,
+            attack_angle: 0.0,
+            name: "".to_owned(),
+            rotation: 0.0,
             position: vec3(
                 global_rng().gen_range(-5.0..=5.0),
                 global_rng().gen_range(-5.0..=5.0),
@@ -332,8 +340,11 @@ impl simple_net::Model for Model {
     }
     fn handle_message(&mut self, player_id: &Id, message: Self::Message) {
         match message {
-            Message::UpdatePosition(position) => {
-                self.players.get_mut(player_id).unwrap().position = position;
+            Message::UpdatePosition(position, rotation, attack_angle) => {
+                let player = self.players.get_mut(player_id).unwrap();
+                player.position = position;
+                player.rotation = rotation;
+                player.attack_angle = attack_angle;
             }
             Message::PlaceBlock(mut block) => {
                 for other in &self.blocks {
@@ -347,6 +358,9 @@ impl simple_net::Model for Model {
             }
             Message::DeleteBlock(id) => {
                 self.blocks.remove(&id);
+            }
+            Message::ChangeName(name) => {
+                self.players.get_mut(player_id).unwrap().name = name;
             }
         }
     }
@@ -467,7 +481,10 @@ struct Game {
     floor: Block,
     place_rotation: f32,
     block_size: f32,
+    players: Collection<Player>,
+    editing: bool,
 }
+const PLACE_DISTANCE: f32 = 20.0;
 
 impl Game {
     fn new(geng: &Geng, player_id: Id, model: simple_net::Remote<Model>) -> Self {
@@ -493,6 +510,8 @@ impl Game {
             place_rotation: 0.0,
             falling_blocks: Vec::new(),
             block_size: 1.5,
+            players: Collection::new(),
+            editing: false,
         }
     }
     fn look(&self) -> Option<(Option<Id>, Vec3<f32>, Side)> {
@@ -552,7 +571,6 @@ impl Game {
             return None;
         }
         let mut pos = ray.from;
-        const PLACE_DISTANCE: f32 = 20.0;
         while (pos - ray.from).len() < PLACE_DISTANCE {
             {
                 let layer = (pos.z + if ray.dir.z > 0.0 { -0.5 } else { 0.5 }).floor() as i32;
@@ -649,14 +667,29 @@ impl geng::State for Game {
             while self.next_update < 0.0 {
                 self.next_update += 1.0 / <Model as simple_net::Model>::TICKS_PER_SECOND;
             }
-            self.model
-                .send(Message::UpdatePosition(self.player.position));
+            self.model.send(Message::UpdatePosition(
+                self.player.position,
+                self.camera.rotation,
+                self.camera.attack_angle,
+            ));
         }
 
         for block in &mut self.falling_blocks {
             block.t += delta_time;
         }
         self.falling_blocks.retain(|block| block.t < 10.0);
+
+        self.players
+            .retain(|player| model.players.get(&player.id).is_some());
+        for player in &model.players {
+            if self.players.get(&player.id).is_none() {
+                self.players.insert(player.clone());
+            }
+            let p = self.players.get_mut(&player.id).unwrap();
+            p.position += (player.position - p.position) * (delta_time * 5.0).min(1.0);
+            p.rotation += (player.rotation - p.rotation) * (delta_time * 5.0).min(1.0);
+            p.attack_angle += (player.attack_angle - p.attack_angle) * (delta_time * 5.0).min(1.0);
+        }
     }
     fn draw(&mut self, framebuffer: &mut ugli::Framebuffer) {
         self.framebuffer_size = framebuffer.size();
@@ -678,7 +711,10 @@ impl geng::State for Game {
                 block.matrix(),
                 Color::BLACK,
                 match look {
-                    Some((block_id, _, _)) if block_id == Some(block.id) => {
+                    Some((block_id, pos, _))
+                        if block_id == Some(block.id)
+                            && (pos - self.player.position).len() < PLACE_DISTANCE =>
+                    {
                         Color::rgb(0.7, 0.7, 0.7)
                     }
                     _ => Color::WHITE,
@@ -719,20 +755,74 @@ impl geng::State for Game {
             Color::BLACK,
         );
         for player in &model.players {
+            if player.id == self.player.id {
+                continue;
+            }
+            let interpolated = match self.players.get(&player.id) {
+                Some(p) => p,
+                None => continue,
+            };
+            let mat =
+                Mat4::translate(interpolated.position) * Mat4::rotate_z(interpolated.rotation);
+            let head_mat = mat
+                * Mat4::translate(vec3(0.0, 0.0, Player::HEIGHT - Player::RADIUS))
+                * Mat4::rotate_x(interpolated.attack_angle / 2.0);
             self.renderer.draw(
                 framebuffer,
                 &self.camera,
-                Block {
-                    id: player.id,
-                    position: player.position.xy(),
-                    rotation: 0.0,
-                    size: vec2(Player::RADIUS, Player::RADIUS),
-                    layer: player.position.z as i32,
-                }
-                .matrix(),
+                mat * Mat4::scale(vec3(
+                    Player::RADIUS / 2.0,
+                    Player::RADIUS / 2.0,
+                    (Player::HEIGHT - Player::RADIUS * 2.0) / 2.0,
+                )) * Mat4::translate(vec3(0.0, 0.0, 1.0)),
                 Color::BLACK,
-                Color::TRANSPARENT_BLACK,
+                Color::WHITE,
             );
+            self.renderer.draw(
+                framebuffer,
+                &self.camera,
+                head_mat * Mat4::scale_uniform(Player::RADIUS),
+                Color::BLACK,
+                Color::WHITE,
+            );
+            for eye_pos in [-1.0, 1.0] {
+                self.renderer.draw(
+                    framebuffer,
+                    &self.camera,
+                    head_mat
+                        * Mat4::translate(vec3(
+                            Player::RADIUS / 2.0 * eye_pos,
+                            Player::RADIUS,
+                            Player::RADIUS * 0.5,
+                        ))
+                        * Mat4::scale_uniform(0.1),
+                    Color::BLACK,
+                    Color::BLACK,
+                );
+            }
+            self.renderer.draw(
+                framebuffer,
+                &self.camera,
+                head_mat
+                    * Mat4::translate(vec3(0.0, Player::RADIUS, -Player::RADIUS * 0.5))
+                    * Mat4::scale(vec3(Player::RADIUS * 0.6, 0.1, 0.1)),
+                Color::BLACK,
+                Color::BLACK,
+            );
+            if let Some(pos) = self.camera.world_to_screen(
+                self.framebuffer_size.map(|x| x as f32),
+                interpolated.position + vec3(0.0, 0.0, Player::HEIGHT * 1.1),
+            ) {
+                self.geng.default_font().draw(
+                    framebuffer,
+                    &geng::PixelPerfectCamera,
+                    dbg!(&player.name),
+                    pos,
+                    geng::TextAlign::CENTER,
+                    32.0,
+                    Color::BLACK,
+                );
+            }
         }
 
         // for a in &model.blocks {
@@ -755,10 +845,24 @@ impl geng::State for Game {
         //         }
         //     }
         // }
+
+        self.geng.default_font().draw(
+            framebuffer,
+            &geng::PixelPerfectCamera,
+            if self.editing {
+                self.player.name.as_str()
+            } else {
+                "Press Enter to change name"
+            },
+            vec2(self.framebuffer_size.x as f32 / 2.0, 10.0),
+            geng::TextAlign::CENTER,
+            32.0,
+            Color::BLACK,
+        );
     }
     fn handle_event(&mut self, event: geng::Event) {
         match event {
-            geng::Event::MouseMove { delta, .. } => {
+            geng::Event::MouseMove { delta, .. } if !self.editing => {
                 let delta = delta.map(|x| x as f32);
                 // if self
                 //     .geng
@@ -788,24 +892,42 @@ impl geng::State for Game {
                 button: geng::MouseButton::Right,
                 ..
             } => {
-                if let Some((Some(block_id), ..)) = self.look() {
-                    self.model.send(Message::DeleteBlock(block_id));
-                }
-            }
-            geng::Event::KeyDown { key } => match key {
-                geng::Key::Space => {
-                    if self.player.can_jump {
-                        self.player.jump_speed = Player::JUMP_INITIAL_SPEED;
+                if let Some((Some(block_id), pos, ..)) = self.look() {
+                    if (pos - self.player.position).len() < PLACE_DISTANCE {
+                        self.model.send(Message::DeleteBlock(block_id));
                     }
                 }
-                geng::Key::PageDown => {
-                    self.block_size = (self.block_size - 0.5).max(0.5);
+            }
+            geng::Event::KeyDown { key } => {
+                match key {
+                    geng::Key::Space => {
+                        if self.player.can_jump {
+                            self.player.jump_speed = Player::JUMP_INITIAL_SPEED;
+                        }
+                    }
+                    geng::Key::PageDown => {
+                        self.block_size = (self.block_size - 0.5).max(0.5);
+                    }
+                    geng::Key::PageUp => {
+                        self.block_size = (self.block_size + 0.5).min(2.0);
+                    }
+                    geng::Key::Enter => {
+                        self.editing = !self.editing;
+                        if !self.editing {
+                            self.model
+                                .send(Message::ChangeName(self.player.name.clone()));
+                        }
+                    }
+                    geng::Key::Backspace if self.editing => {
+                        self.player.name.pop();
+                    }
+                    _ => {}
                 }
-                geng::Key::PageUp => {
-                    self.block_size = (self.block_size + 0.5).min(2.0);
+                let c = format!("{:?}", key);
+                if c.len() == 1 && self.editing {
+                    self.player.name.push_str(&c);
                 }
-                _ => {}
-            },
+            }
             geng::Event::Wheel { delta } => {
                 self.place_rotation += delta as f32 * 0.005;
             }
