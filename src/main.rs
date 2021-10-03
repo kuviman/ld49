@@ -575,6 +575,7 @@ struct Game {
     editing: bool,
     assets: Assets,
     last_blocks: HashSet<Id>,
+    show_names: bool,
 }
 const PLACE_DISTANCE: f32 = 20.0;
 
@@ -591,6 +592,7 @@ impl Game {
         let player = model.get().players.get(&player_id).unwrap().clone();
         let last_blocks = model.get().blocks.iter().map(|block| block.id).collect();
         Self {
+            show_names: true,
             assets,
             framebuffer_size: vec2(1, 1),
             geng: geng.clone(),
@@ -1019,19 +1021,21 @@ impl geng::State for Game {
                 Color::BLACK,
                 Color::BLACK,
             );
-            if let Some(pos) = self.camera.world_to_screen(
-                self.framebuffer_size.map(|x| x as f32),
-                interpolated.position + vec3(0.0, 0.0, Player::HEIGHT * 1.1),
-            ) {
-                self.geng.default_font().draw(
-                    framebuffer,
-                    &geng::PixelPerfectCamera,
-                    &player.name,
-                    pos,
-                    geng::TextAlign::CENTER,
-                    32.0,
-                    Color::BLACK,
-                );
+            if self.show_names {
+                if let Some(pos) = self.camera.world_to_screen(
+                    self.framebuffer_size.map(|x| x as f32),
+                    interpolated.position + vec3(0.0, 0.0, Player::HEIGHT * 1.1),
+                ) {
+                    self.geng.default_font().draw(
+                        framebuffer,
+                        &geng::PixelPerfectCamera,
+                        &player.name,
+                        pos,
+                        geng::TextAlign::CENTER,
+                        32.0,
+                        Color::BLACK,
+                    );
+                }
             }
         }
 
@@ -1171,6 +1175,9 @@ impl geng::State for Game {
                     }
                     geng::Key::Backspace if self.editing => {
                         self.player.name.pop();
+                    }
+                    geng::Key::T => {
+                        self.show_names = !self.show_names;
                     }
                     _ => {}
                 }
