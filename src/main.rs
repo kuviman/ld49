@@ -25,6 +25,28 @@ struct Player {
     can_jump: bool,
 }
 
+#[derive(Deref, DerefMut)]
+struct InterpolatedPlayer {
+    #[deref]
+    #[deref_mut]
+    player: Player,
+    swing_amp: f32,
+    t: f32,
+}
+
+impl InterpolatedPlayer {
+    fn swing(&self) -> f32 {
+        (self.t * 10.0).sin() * self.swing_amp
+    }
+}
+
+impl HasId for InterpolatedPlayer {
+    type Id = Id;
+    fn id(&self) -> &Id {
+        &self.id
+    }
+}
+
 impl HasId for Player {
     type Id = Id;
     fn id(&self) -> &Id {
@@ -507,7 +529,7 @@ struct Game {
     floor: Block,
     place_rotation: f32,
     block_size: f32,
-    players: Collection<Player>,
+    interpolated_players: Collection<InterpolatedPlayer>,
     editing: bool,
 }
 const PLACE_DISTANCE: f32 = 20.0;
@@ -536,7 +558,7 @@ impl Game {
             place_rotation: 0.0,
             falling_blocks: Vec::new(),
             block_size: 1.5,
-            players: Collection::new(),
+            interpolated_players: Collection::new(),
             editing: false,
         }
     }
@@ -718,16 +740,28 @@ impl geng::State for Game {
         }
         self.falling_blocks.retain(|block| block.t < 10.0);
 
-        self.players
+        self.interpolated_players
             .retain(|player| model.players.get(&player.id).is_some());
         for player in &model.players {
-            if self.players.get(&player.id).is_none() {
-                self.players.insert(player.clone());
+            if self.interpolated_players.get(&player.id).is_none() {
+                self.interpolated_players.insert(InterpolatedPlayer {
+                    player: player.clone(),
+                    t: 0.0,
+                    swing_amp: 0.0,
+                });
             }
-            let p = self.players.get_mut(&player.id).unwrap();
-            p.position += (player.position - p.position) * (delta_time * 5.0).min(1.0);
-            p.rotation += (player.rotation - p.rotation) * (delta_time * 5.0).min(1.0);
-            p.attack_angle += (player.attack_angle - p.attack_angle) * (delta_time * 5.0).min(1.0);
+            let interpolated = self.interpolated_players.get_mut(&player.id).unwrap();
+            interpolated.swing_amp += ((player.position - interpolated.position).len().min(1.0)
+                - interpolated.swing_amp)
+                * (delta_time * 10.0).min(1.0);
+            interpolated.t += delta_time;
+            let interpolated = &mut **interpolated;
+            interpolated.position +=
+                (player.position - interpolated.position) * (delta_time * 5.0).min(1.0);
+            interpolated.rotation +=
+                (player.rotation - interpolated.rotation) * (delta_time * 5.0).min(1.0);
+            interpolated.attack_angle +=
+                (player.attack_angle - interpolated.attack_angle) * (delta_time * 5.0).min(1.0);
         }
     }
     fn draw(&mut self, framebuffer: &mut ugli::Framebuffer) {
@@ -798,7 +832,7 @@ impl geng::State for Game {
             if player.id == self.player.id {
                 continue;
             }
-            let interpolated = match self.players.get(&player.id) {
+            let interpolated = match self.interpolated_players.get(&player.id) {
                 Some(p) => p,
                 None => continue,
             };
@@ -806,38 +840,76 @@ impl geng::State for Game {
                 Mat4::translate(interpolated.position) * Mat4::rotate_z(interpolated.rotation);
             let head_mat = mat
                 * Mat4::translate(vec3(0.0, 0.0, Player::HEIGHT - Player::RADIUS))
-                * Mat4::rotate_x(interpolated.attack_angle / 2.0);
+                * Mat4::rotate_x((interpolated.attack_angle / 2.0).max(-f32::PI / 8.0));
+            let skin_color = Color::rgb(1.0, 0.8, 0.8);
             self.renderer.draw(
                 framebuffer,
                 &self.camera,
-                mat * Mat4::scale(vec3(
-                    Player::RADIUS / 2.0,
-                    Player::RADIUS / 2.0,
-                    (Player::HEIGHT - Player::RADIUS * 2.0) / 2.0,
-                )) * Mat4::translate(vec3(0.0, 0.0, 1.0)),
+                mat * Mat4::translate(vec3(0.0, 0.0, Player::HEIGHT / 3.0))
+                    * Mat4::scale(vec3(
+                        Player::RADIUS / 2.0,
+                        Player::RADIUS / 2.0,
+                        (Player::HEIGHT - Player::HEIGHT / 3.0 - Player::RADIUS) / 2.0,
+                    ))
+                    * Mat4::translate(vec3(0.0, 0.0, 1.0)),
                 Color::BLACK,
-                Color::rgb(1.0, 0.8, 0.8),
+                skin_color,
             );
             self.renderer.draw(
                 framebuffer,
                 &self.camera,
                 head_mat * Mat4::scale_uniform(Player::RADIUS),
                 Color::BLACK,
-                Color::rgb(1.0, 0.8, 0.8),
+                skin_color,
             );
-            for eye_pos in [-1.0, 1.0] {
+            let swing = interpolated.swing();
+            for side in [-1.0, 1.0] {
                 self.renderer.draw(
                     framebuffer,
                     &self.camera,
                     head_mat
                         * Mat4::translate(vec3(
-                            Player::RADIUS / 2.0 * eye_pos,
+                            Player::RADIUS / 2.0 * side,
                             Player::RADIUS,
                             Player::RADIUS * 0.5,
                         ))
                         * Mat4::scale_uniform(0.1),
                     Color::BLACK,
                     Color::BLACK,
+                );
+                self.renderer.draw(
+                    framebuffer,
+                    &self.camera,
+                    mat * Mat4::translate(vec3(
+                        Player::RADIUS * side,
+                        0.0,
+                        Player::HEIGHT - Player::RADIUS * 2.0,
+                    )) * Mat4::rotate_x(swing * side)
+                        * Mat4::scale(vec3(
+                            Player::RADIUS / 4.0,
+                            Player::RADIUS / 4.0,
+                            Player::HEIGHT / 4.0,
+                        ))
+                        * Mat4::translate(vec3(0.0, 0.0, -1.0)),
+                    Color::BLACK,
+                    skin_color,
+                );
+                self.renderer.draw(
+                    framebuffer,
+                    &self.camera,
+                    mat * Mat4::translate(vec3(
+                        Player::RADIUS / 2.0 * side,
+                        0.0,
+                        Player::HEIGHT / 3.0,
+                    )) * Mat4::rotate_x(-swing * side)
+                        * Mat4::scale(vec3(
+                            Player::RADIUS / 4.0,
+                            Player::RADIUS / 4.0,
+                            Player::HEIGHT / 6.0,
+                        ))
+                        * Mat4::translate(vec3(0.0, 0.0, -1.0)),
+                    Color::BLACK,
+                    skin_color,
                 );
             }
             self.renderer.draw(
@@ -856,7 +928,7 @@ impl geng::State for Game {
                 self.geng.default_font().draw(
                     framebuffer,
                     &geng::PixelPerfectCamera,
-                    dbg!(&player.name),
+                    &player.name,
                     pos,
                     geng::TextAlign::CENTER,
                     32.0,
