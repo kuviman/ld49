@@ -77,12 +77,12 @@ impl Player {
         );
         let mut penetration = vertical_penetration;
         let mut normal = vertical_normal;
-        let delta_pos = Vec2::rotated(self.position.xy() - block.position, -block.rotation);
+        let delta_pos = Vec2::rotate(self.position.xy() - block.position, -block.rotation);
         let size = block.size + vec2(Self::RADIUS, Self::RADIUS);
         let x_penetration = size.x - delta_pos.x.abs();
         if x_penetration < penetration {
             penetration = x_penetration;
-            normal = Vec2::rotated(
+            normal = Vec2::rotate(
                 vec2(if delta_pos.x > 0.0 { 1.0 } else { -1.0 }, 0.0),
                 block.rotation,
             )
@@ -91,7 +91,7 @@ impl Player {
         let y_penetration = size.y - delta_pos.y.abs();
         if y_penetration < penetration {
             penetration = y_penetration;
-            normal = Vec2::rotated(
+            normal = Vec2::rotate(
                 vec2(0.0, if delta_pos.y > 0.0 { 1.0 } else { -1.0 }),
                 block.rotation,
             )
@@ -263,7 +263,7 @@ impl Block {
         }
     }
     pub fn points_2d(&self) -> Vec<Vec2<f32>> {
-        let e1 = Vec2::rotated(vec2(1.0, 0.0), self.rotation);
+        let e1 = Vec2::rotate(vec2(1.0, 0.0), self.rotation);
         let e2 = Vec2::rotate_90(e1);
 
         let sx = e1 * self.size.x;
@@ -781,7 +781,7 @@ impl geng::State for Game {
         }
         self.block_size = clamp(self.block_size, 0.5..=2.0);
         self.player.position +=
-            Vec2::rotated(direction, self.camera.rotation).extend(0.0) * SPEED * delta_time;
+            Vec2::rotate(direction, self.camera.rotation).extend(0.0) * SPEED * delta_time;
         self.player.jump_speed -= GRAVITY * delta_time;
         self.player.position.z += self.player.jump_speed * delta_time;
 
