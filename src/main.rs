@@ -610,7 +610,7 @@ impl Game {
             },
             place_rotation: 0.0,
             falling_blocks: Vec::new(),
-            block_size: 1.5,
+            block_size: 0.5,
             interpolated_players: Collection::new(),
             editing: false,
             last_blocks,
